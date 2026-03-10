@@ -1,0 +1,165 @@
+name: Package emsdk
+
+on:
+  workflow_dispatch:
+    inputs:
+      emsdk_version:
+        description: 'emsdk version to package'
+        required: true
+        default: '5.0.0'
+
+jobs:
+  package:
+    strategy:
+      matrix:
+        include:
+          - os: macos-latest
+            platform: mac
+            ext: tar.gz
+          - os: windows-latest
+            platform: win
+            ext: zip
+          - os: ubuntu-latest
+            platform: linux
+            ext: tar.gz
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Install emsdk
+        uses: mymindstorm/setup-emsdk@v14
+        with:
+          version: ${{ inputs.emsdk_version }}
+
+      - name: Locate emsdk
+        id: locate
+        shell: bash
+        run: |
+          echo "emsdk_dir=$EMSDK" >> "$GITHUB_OUTPUT"
+
+      - name: Package (tar.gz)
+        if: matrix.ext == 'tar.gz'
+        shell: bash
+        run: |
+          VERSION="${{ inputs.emsdk_version }}"
+          ARCHIVE="emsdk-${VERSION}-${{ matrix.platform }}.tar.gz"
+          EMSDK_DIR="${{ steps.locate.outputs.emsdk_dir }}"
+
+          KEEP_DIRS=(
+            upstream/emscripten
+            upstream/bin
+            upstream/lib
+            python
+            node
+          )
+          KEEP_FILES=(
+            .emscripten
+            emsdk
+            emsdk_env.sh
+            emsdk_env.fish
+            emsdk_manifest.json
+          )
+
+          LINK_NAME="emsdk-${VERSION}-${{ matrix.platform }}"
+          ln -sf "$EMSDK_DIR" "/tmp/$LINK_NAME"
+
+          INCLUDES=""
+          for d in "${KEEP_DIRS[@]}"; do
+            if [ -d "$EMSDK_DIR/$d" ]; then
+              INCLUDES="$INCLUDES $LINK_NAME/$d"
+            fi
+          done
+          for f in "${KEEP_FILES[@]}"; do
+            if [ -f "$EMSDK_DIR/$f" ]; then
+              INCLUDES="$INCLUDES $LINK_NAME/$f"
+            fi
+          done
+
+          tar czf "$ARCHIVE" -C /tmp $INCLUDES
+          ls -lh "$ARCHIVE"
+
+      - name: Package (zip)
+        if: matrix.ext == 'zip'
+        shell: pwsh
+        run: |
+          $Version = "${{ inputs.emsdk_version }}"
+          $Platform = "${{ matrix.platform }}"
+          $Archive = "emsdk-${Version}-${Platform}.zip"
+          $EmsdkDir = "${{ steps.locate.outputs.emsdk_dir }}"
+          $StagingDir = "$env:RUNNER_TEMP\emsdk-staging"
+          $TopDir = "emsdk-${Version}-${Platform}"
+          $DestDir = Join-Path $StagingDir $TopDir
+
+          New-Item -ItemType Directory -Path $DestDir -Force | Out-Null
+
+          $keepDirs = @(
+            "upstream\emscripten",
+            "upstream\bin",
+            "upstream\lib",
+            "python",
+            "node"
+          )
+          $keepFiles = @(
+            ".emscripten",
+            "emsdk.bat",
+            "emsdk.ps1",
+            "emsdk_env.bat",
+            "emsdk_env.ps1",
+            "emsdk_manifest.json"
+          )
+
+          foreach ($d in $keepDirs) {
+            $src = Join-Path $EmsdkDir $d
+            if (Test-Path $src) {
+              $dst = Join-Path $DestDir $d
+              Copy-Item -Path $src -Destination $dst -Recurse -Force
+            }
+          }
+          foreach ($f in $keepFiles) {
+            $src = Join-Path $EmsdkDir $f
+            if (Test-Path $src) {
+              Copy-Item -Path $src -Destination (Join-Path $DestDir $f) -Force
+            }
+          }
+
+          Compress-Archive -Path (Join-Path $StagingDir $TopDir) -DestinationPath $Archive -Force
+          Get-Item $Archive | Select-Object Name, @{N='Size(MB)';E={[math]::Round($_.Length/1MB,1)}}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: emsdk-${{ inputs.emsdk_version }}-${{ matrix.platform }}
+          path: emsdk-${{ inputs.emsdk_version }}-${{ matrix.platform }}.${{ matrix.ext }}
+          retention-days: 1
+
+  release:
+    needs: package
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: List archives
+        run: ls -lh dist/
+
+      - name: Create Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="${{ inputs.emsdk_version }}"
+          gh release create "v${VERSION}" \
+            --repo "${{ github.repository }}" \
+            --title "emsdk ${VERSION}" \
+            --notes "Pre-packaged emsdk ${VERSION} toolchain for ESEngine Editor.
+
+          Includes Emscripten ${VERSION} (pre-activated), bundled Python, wasm-opt.
+
+          | File | Platform |
+          |------|----------|
+          | \`emsdk-${VERSION}-mac.tar.gz\` | macOS |
+          | \`emsdk-${VERSION}-win.zip\` | Windows |
+          | \`emsdk-${VERSION}-linux.tar.gz\` | Linux |" \
+            dist/*
