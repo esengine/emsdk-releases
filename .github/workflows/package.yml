@@ -24,16 +24,42 @@ jobs:
             ext: tar.gz
     runs-on: ${{ matrix.os }}
     steps:
-      - name: Install emsdk
-        uses: mymindstorm/setup-emsdk@v14
-        with:
-          version: ${{ inputs.emsdk_version }}
-
-      - name: Locate emsdk
-        id: locate
+      - name: Clone and install emsdk
         shell: bash
         run: |
-          echo "emsdk_dir=$EMSDK" >> "$GITHUB_OUTPUT"
+          git clone --depth 1 https://github.com/emscripten-core/emsdk.git "$RUNNER_TEMP/emsdk"
+          cd "$RUNNER_TEMP/emsdk"
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            ./emsdk.bat install ${{ inputs.emsdk_version }}
+            ./emsdk.bat activate ${{ inputs.emsdk_version }}
+          else
+            ./emsdk install ${{ inputs.emsdk_version }}
+            ./emsdk activate ${{ inputs.emsdk_version }}
+          fi
+
+      - name: Verify emsdk structure
+        shell: bash
+        run: |
+          EMSDK_DIR="$RUNNER_TEMP/emsdk"
+          echo "=== Top-level files ==="
+          ls -la "$EMSDK_DIR"
+          echo ""
+          echo "=== upstream/bin ==="
+          ls "$EMSDK_DIR/upstream/bin/" 2>/dev/null | head -20 || echo "(not found)"
+          echo ""
+          echo "=== python dir ==="
+          ls "$EMSDK_DIR/python/" 2>/dev/null || echo "(not found)"
+          echo ""
+          echo "=== node dir ==="
+          ls "$EMSDK_DIR/node/" 2>/dev/null || echo "(not found)"
+          echo ""
+          echo "=== .emscripten ==="
+          cat "$EMSDK_DIR/.emscripten" 2>/dev/null || echo "(not found)"
+          echo ""
+          echo "=== emcc version ==="
+          "$EMSDK_DIR/upstream/emscripten/emcc" --version 2>/dev/null || \
+            "$EMSDK_DIR/upstream/emscripten/emcc.bat" --version 2>/dev/null || \
+            echo "(emcc not found)"
 
       - name: Package (tar.gz)
         if: matrix.ext == 'tar.gz'
@@ -41,7 +67,7 @@ jobs:
         run: |
           VERSION="${{ inputs.emsdk_version }}"
           ARCHIVE="emsdk-${VERSION}-${{ matrix.platform }}.tar.gz"
-          EMSDK_DIR="${{ steps.locate.outputs.emsdk_dir }}"
+          EMSDK_DIR="$RUNNER_TEMP/emsdk"
 
           KEEP_DIRS=(
             upstream/emscripten
@@ -65,14 +91,22 @@ jobs:
           for d in "${KEEP_DIRS[@]}"; do
             if [ -d "$EMSDK_DIR/$d" ]; then
               INCLUDES="$INCLUDES $LINK_NAME/$d"
+              echo "  include dir: $d"
+            else
+              echo "  SKIP dir (not found): $d"
             fi
           done
           for f in "${KEEP_FILES[@]}"; do
             if [ -f "$EMSDK_DIR/$f" ]; then
               INCLUDES="$INCLUDES $LINK_NAME/$f"
+              echo "  include file: $f"
+            else
+              echo "  SKIP file (not found): $f"
             fi
           done
 
+          echo ""
+          echo "Creating archive..."
           tar czf "$ARCHIVE" -C /tmp $INCLUDES
           ls -lh "$ARCHIVE"
 
@@ -83,7 +117,7 @@ jobs:
           $Version = "${{ inputs.emsdk_version }}"
           $Platform = "${{ matrix.platform }}"
           $Archive = "emsdk-${Version}-${Platform}.zip"
-          $EmsdkDir = "${{ steps.locate.outputs.emsdk_dir }}"
+          $EmsdkDir = "$env:RUNNER_TEMP\emsdk"
           $StagingDir = "$env:RUNNER_TEMP\emsdk-staging"
           $TopDir = "emsdk-${Version}-${Platform}"
           $DestDir = Join-Path $StagingDir $TopDir
@@ -111,15 +145,23 @@ jobs:
             if (Test-Path $src) {
               $dst = Join-Path $DestDir $d
               Copy-Item -Path $src -Destination $dst -Recurse -Force
+              Write-Host "  include dir: $d"
+            } else {
+              Write-Host "  SKIP dir (not found): $d"
             }
           }
           foreach ($f in $keepFiles) {
             $src = Join-Path $EmsdkDir $f
             if (Test-Path $src) {
               Copy-Item -Path $src -Destination (Join-Path $DestDir $f) -Force
+              Write-Host "  include file: $f"
+            } else {
+              Write-Host "  SKIP file (not found): $f"
             }
           }
 
+          Write-Host ""
+          Write-Host "Creating archive..."
           Compress-Archive -Path (Join-Path $StagingDir $TopDir) -DestinationPath $Archive -Force
           Get-Item $Archive | Select-Object Name, @{N='Size(MB)';E={[math]::Round($_.Length/1MB,1)}}
 
@@ -145,12 +187,18 @@ jobs:
       - name: List archives
         run: ls -lh dist/
 
-      - name: Create Release
+      - name: Create or update Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           VERSION="${{ inputs.emsdk_version }}"
-          gh release create "v${VERSION}" \
+          TAG="v${VERSION}"
+
+          # Delete existing release if any
+          gh release delete "$TAG" --repo "${{ github.repository }}" --yes 2>/dev/null || true
+          git push --delete origin "refs/tags/$TAG" 2>/dev/null || true
+
+          gh release create "$TAG" \
             --repo "${{ github.repository }}" \
             --title "emsdk ${VERSION}" \
             --notes "Pre-packaged emsdk ${VERSION} toolchain for ESEngine Editor.
